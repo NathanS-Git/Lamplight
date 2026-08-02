@@ -3,40 +3,22 @@ module Physics
 open System
 open Types
 
-// The same soft force layout works well for both the compact file graph and
-// the denser function graph. It is deliberately deterministic apart from
-// user movement, which makes a freshly loaded codebase settle predictably.
-// Keep cards separated enough that labels remain readable, especially in the
-// denser function view. The graph is still intentionally loose rather than
-// trying to pack every node into the viewport.
+// Tuned for a readable layout while keeping the active simulation cheap.
 let repulsionStrength = 20000.0
 let springLength = 200.0
 let springStrength = 0.035
-
-// Function nodes belonging to one source file get a weak long-range cohesion
-// force. Repulsion still controls their minimum spacing, while this force
-// gently pulls a file's functions into a visible cluster.
 let sameFileAttractionDistance = 145.0
 let sameFileAttractionStrength = 0.008
-
-// Canvas cards are larger than their center-to-center distance can suggest.
-// This is a soft visual repulsion: it uses the rendered card dimensions and
-// starts fading in before cards get close, rather than imposing a rigid wall.
-// The wider influence radius creates breathing room without making the layout
-// feel overly springy or explosive.
 let collisionGap = 200.0
 let collisionInfluenceScale = 1.35
 let collisionStrength = 0.22
-
 let damping = 0.90
 let centeringStrength = 0.0025
 let maxSpeed = 24.0
 let timeStep = 0.5
 
-// Barnes-Hut approximation settings. A cell is treated as one aggregate mass
-// when it is sufficiently far away; nearby cells are opened so local spacing
-// remains accurate. This changes the expensive all-pairs repulsion from O(n²)
-// to approximately O(n log n) for larger function graphs.
+// Barnes-Hut settings. Distant cells are represented by their aggregate mass;
+// nearby cells are opened so local spacing remains accurate.
 let private barnesHutTheta = 0.62
 let private quadBucketSize = 4
 let private quadMaxDepth = 14
@@ -54,7 +36,7 @@ let private distanceAndDir x1 y1 x2 y2 =
         distance, dx / distance, dy / distance
 
 type private QuadCell(minX: float, minY: float, maxX: float, maxY: float, depth: int) =
-    let mutable points: CodeNode list = []
+    let mutable points: int list = []
     let mutable children: QuadCell array option = None
     let mutable mass = 0.0
     let mutable centerX = 0.0
@@ -79,7 +61,7 @@ type private QuadCell(minX: float, minY: float, maxX: float, maxY: float, depth:
         elif x < midX then 2
         else 3
 
-    member private this.Subdivide() =
+    member private this.Subdivide (nodes: CodeNode array) =
         let midX = (minX + maxX) / 2.0
         let midY = (minY + maxY) / 2.0
         children <- Some [|
@@ -90,30 +72,31 @@ type private QuadCell(minX: float, minY: float, maxX: float, maxY: float, depth:
         |]
         let existing = points
         points <- []
-        for point in existing do this.Insert point
+        for index in existing do this.Insert index nodes
 
-    member this.Insert (point: CodeNode) =
+    member this.Insert index (nodes: CodeNode array) =
+        let point = nodes.[index]
         match children with
-        | Some cells -> cells.[this.ChildIndex point.X point.Y].Insert point
+        | Some cells -> cells.[this.ChildIndex point.X point.Y].Insert index nodes
         | None when points.Length < quadBucketSize || depth >= quadMaxDepth ->
-            points <- point :: points
+            points <- index :: points
         | None ->
-            this.Subdivide()
-            this.Insert point
+            this.Subdivide nodes
+            this.Insert index nodes
 
-    member this.UpdateMass() =
+    member this.UpdateMass (nodes: CodeNode array) =
         match children with
         | None ->
             mass <- float points.Length
             if mass > 0.0 then
-                centerX <- points |> List.averageBy (fun point -> point.X)
-                centerY <- points |> List.averageBy (fun point -> point.Y)
+                centerX <- points |> List.averageBy (fun index -> nodes.[index].X)
+                centerY <- points |> List.averageBy (fun index -> nodes.[index].Y)
             else
                 centerX <- (minX + maxX) / 2.0
                 centerY <- (minY + maxY) / 2.0
         | Some cells ->
-            for cell in cells do cell.UpdateMass ()
-            mass <- cells |> Array.sumBy (fun cell -> cell.Mass)
+            for cell in cells do cell.UpdateMass nodes
+            mass <- cells |> Array.sumBy (fun (cell: QuadCell) -> cell.Mass)
             if mass > 0.0 then
                 centerX <- (cells |> Array.sumBy (fun (cell: QuadCell) -> cell.CenterX * cell.Mass)) / mass
                 centerY <- (cells |> Array.sumBy (fun (cell: QuadCell) -> cell.CenterY * cell.Mass)) / mass
@@ -121,47 +104,56 @@ type private QuadCell(minX: float, minY: float, maxX: float, maxY: float, depth:
                 centerX <- (minX + maxX) / 2.0
                 centerY <- (minY + maxY) / 2.0
 
-let private buildQuadTree (nodes: CodeNode list) =
-    let minX = nodes |> List.map (fun node -> node.X) |> List.min
-    let maxX = nodes |> List.map (fun node -> node.X) |> List.max
-    let minY = nodes |> List.map (fun node -> node.Y) |> List.min
-    let maxY = nodes |> List.map (fun node -> node.Y) |> List.max
+let private buildQuadTree (nodes: CodeNode array) =
+    let minX = nodes |> Array.map (fun node -> node.X) |> Array.min
+    let maxX = nodes |> Array.map (fun node -> node.X) |> Array.max
+    let minY = nodes |> Array.map (fun node -> node.Y) |> Array.min
+    let maxY = nodes |> Array.map (fun node -> node.Y) |> Array.max
     let lower = min minX minY
     let upper = max maxX maxY
     let span = max 1.0 (upper - lower)
     let root = QuadCell(lower, lower, lower + span, lower + span, 0)
-    for node in nodes do root.Insert node
-    root.UpdateMass ()
+    for index in 0 .. nodes.Length - 1 do root.Insert index nodes
+    root.UpdateMass nodes
     root
 
-let private addForce id fx fy forces =
-    let currentX, currentY = Map.find id forces
-    Map.add id (currentX + fx, currentY + fy) forces
-
-let private applyQuadRepulsion (root: QuadCell) (source: CodeNode) forces =
-    let rec visit (cell: QuadCell) forces =
-        if cell.Mass = 0.0 then
-            forces
-        else
+let private applyQuadRepulsion (root: QuadCell) (sourceIndex: int) (nodes: CodeNode array) (forceX: float array) (forceY: float array) =
+    let source = nodes.[sourceIndex]
+    let rec visit (cell: QuadCell) =
+        if cell.Mass > 0.0 then
             let distance, dirX, dirY = distanceAndDir source.X source.Y cell.CenterX cell.CenterY
             let containsSource =
                 source.X >= cell.MinX && source.X <= cell.MaxX &&
                 source.Y >= cell.MinY && source.Y <= cell.MaxY
             match cell.Children with
             | None ->
-                cell.Points
-                |> List.fold (fun forces target ->
-                    if target.Id = source.Id then forces
-                    else
+                for targetIndex in cell.Points do
+                    if targetIndex <> sourceIndex then
+                        let target = nodes.[targetIndex]
                         let distance, dirX, dirY = distanceAndDir source.X source.Y target.X target.Y
                         let force = repulsionStrength / (distance * distance + 1.0)
-                        addForce source.Id (-dirX * force) (-dirY * force) forces) forces
+                        forceX.[sourceIndex] <- forceX.[sourceIndex] - dirX * force
+                        forceY.[sourceIndex] <- forceY.[sourceIndex] - dirY * force
             | Some cells when not containsSource && cell.Size / distance < barnesHutTheta ->
                 let force = repulsionStrength * cell.Mass / (distance * distance + 1.0)
-                addForce source.Id (-dirX * force) (-dirY * force) forces
+                forceX.[sourceIndex] <- forceX.[sourceIndex] - dirX * force
+                forceY.[sourceIndex] <- forceY.[sourceIndex] - dirY * force
             | Some cells ->
-                cells |> Array.fold (fun forces child -> visit child forces) forces
-    visit root forces
+                for child in cells do visit child
+    visit root
+
+let private collectNearby (root: QuadCell) x y radius (result: ResizeArray<int>) =
+    let radiusSquared = radius * radius
+    let rec visit (cell: QuadCell) =
+        let dx = max 0.0 (max (cell.MinX - x) (x - cell.MaxX))
+        let dy = max 0.0 (max (cell.MinY - y) (y - cell.MaxY))
+        if dx * dx + dy * dy <= radiusSquared then
+            match cell.Children with
+            | None ->
+                for index in cell.Points do result.Add index
+            | Some cells ->
+                for child in cells do visit child
+    visit root
 
 let private nodeWidth (node: CodeNode) =
     match node.Kind with
@@ -175,134 +167,128 @@ let private nodeHeight (node: CodeNode) =
     | SourceFileNode -> 70.0
     | FunctionNode -> 54.0
 
+let private maxVelocity (nodes: CodeNode array) =
+    nodes |> Array.fold (fun current node -> max current (max (abs node.Vx) (abs node.Vy))) 0.0
+
 let applyForces (state: GraphState) (pinnedNodeIds: Set<NodeId>) =
-    let centerX = state.CanvasWidth / 2.0
-    let centerY = state.CanvasHeight / 2.0
-    let initialForces = state.Nodes |> Map.map (fun _ _ -> 0.0, 0.0)
-    let nodes = state.Nodes |> Map.toList |> List.map snd
+    let nodes = state.Nodes |> Map.toArray |> Array.map snd
+    if nodes.Length = 0 then
+        state.Nodes
+    else
+        let nodeCount = nodes.Length
+        let forceX = Array.zeroCreate<float> nodeCount
+        let forceY = Array.zeroCreate<float> nodeCount
+        let widths = nodes |> Array.map nodeWidth
+        let heights = nodes |> Array.map nodeHeight
 
-    let rec repel pairs forces =
-        match pairs with
-        | [] -> forces
-        | (a, b) :: rest ->
-            let distance, dirX, dirY = distanceAndDir a.X a.Y b.X b.Y
-            let force = repulsionStrength / (distance * distance + 1.0)
-            let fx = dirX * force
-            let fy = dirY * force
-            let ax, ay = Map.find a.Id forces
-            let bx, by = Map.find b.Id forces
-            forces
-            |> Map.add a.Id (ax - fx, ay - fy)
-            |> Map.add b.Id (bx + fx, by + fy)
-            |> repel rest
+        let maxId = nodes |> Array.maxBy (fun node -> node.Id) |> fun node -> node.Id
+        let indexById = Array.create (maxId + 1) -1
+        for index in 0 .. nodeCount - 1 do indexById.[nodes.[index].Id] <- index
 
-    let pairs =
-        [ for i in 0 .. nodes.Length - 1 do
-            for j in i + 1 .. nodes.Length - 1 do
-                nodes.[i], nodes.[j] ]
+        // The quadtree is built once and shared by repulsion and the local
+        // card-separation query. No immutable Map is updated inside the hot
+        // force loops.
+        let tree = if nodeCount >= 24 then Some (buildQuadTree nodes) else None
 
-    // Build the spatial index once per physics tick. The tree is only needed
-    // while the layout is moving; GraphEditor avoids calling this function
-    // entirely when physics is paused.
-    let forces =
-        if List.length nodes < 24 then
-            repel pairs initialForces
+        if tree.IsNone then
+            for i in 0 .. nodeCount - 1 do
+                for j in i + 1 .. nodeCount - 1 do
+                    let distance, dirX, dirY = distanceAndDir nodes.[i].X nodes.[i].Y nodes.[j].X nodes.[j].Y
+                    let force = repulsionStrength / (distance * distance + 1.0)
+                    let fx, fy = dirX * force, dirY * force
+                    forceX.[i] <- forceX.[i] - fx
+                    forceY.[i] <- forceY.[i] - fy
+                    forceX.[j] <- forceX.[j] + fx
+                    forceY.[j] <- forceY.[j] + fy
         else
-            let tree = buildQuadTree nodes
-            nodes |> List.fold (fun forces node -> applyQuadRepulsion tree node forces) initialForces
+            let root = tree.Value
+            for i in 0 .. nodeCount - 1 do applyQuadRepulsion root i nodes forceX forceY
 
-    // Push overlapping rendered rectangles apart. Unlike inverse-square
-    // point repulsion, this remains strong while cards overlap and therefore
-    // establishes a much more reliable visual minimum separation.
-    let forces =
-        pairs
-        |> List.fold (fun forces (a, b) ->
-            let distance, dirX, dirY = distanceAndDir a.X a.Y b.X b.Y
-            let cardDistance =
-                sqrt (
-                    ((nodeWidth a + nodeWidth b) / 2.0) ** 2.0 +
-                    ((nodeHeight a + nodeHeight b) / 2.0) ** 2.0)
-            let influenceDistance = cardDistance + collisionGap
-            let softDistance = influenceDistance * collisionInfluenceScale
+        // Only query nearby cards. The query buffer is reused for every node,
+        // so this path does not allocate a candidate list per node or frame.
+        let maxHalfDiagonal =
+            widths
+            |> Array.mapi (fun index width -> sqrt ((width / 2.0) ** 2.0 + (heights.[index] / 2.0) ** 2.0))
+            |> Array.max
+        let collisionRadius = collisionInfluenceScale * (2.0 * maxHalfDiagonal + collisionGap)
+        let applyCollision i j =
+            let distance, dirX, dirY = distanceAndDir nodes.[i].X nodes.[i].Y nodes.[j].X nodes.[j].Y
+            let cardDistance = sqrt (((widths.[i] + widths.[j]) / 2.0) ** 2.0 + ((heights.[i] + heights.[j]) / 2.0) ** 2.0)
+            let softDistance = (cardDistance + collisionGap) * collisionInfluenceScale
             let overlap = softDistance - distance
-            if overlap <= 0.0 then
-                forces
-            else
-                // Normalize the response at the card boundary. This makes
-                // the force smooth over its wider radius instead of creating
-                // a hard collision impulse.
+            if overlap > 0.0 then
                 let normalizedOverlap = overlap / max 1.0 (softDistance - cardDistance)
                 let force = normalizedOverlap * collisionStrength
-                let fx = dirX * force
-                let fy = dirY * force
-                let ax, ay = Map.find a.Id forces
-                let bx, by = Map.find b.Id forces
-                forces
-                |> Map.add a.Id (ax - fx, ay - fy)
-                |> Map.add b.Id (bx + fx, by + fy)) forces
+                let fx, fy = dirX * force, dirY * force
+                forceX.[i] <- forceX.[i] - fx
+                forceY.[i] <- forceY.[i] - fy
+                forceX.[j] <- forceX.[j] + fx
+                forceY.[j] <- forceY.[j] + fy
 
-    let forces =
-        state.Edges
-        |> Map.fold (fun forces _ edge ->
-            match Map.tryFind edge.Source state.Nodes, Map.tryFind edge.Target state.Nodes with
-            | Some source, Some target ->
-                let distance, dirX, dirY = distanceAndDir source.X source.Y target.X target.Y
-                let force = springStrength * (distance - springLength)
-                let fx = dirX * force
-                let fy = dirY * force
-                let sx, sy = Map.find source.Id forces
-                let tx, ty = Map.find target.Id forces
-                forces
-                |> Map.add source.Id (sx + fx, sy + fy)
-                |> Map.add target.Id (tx - fx, ty - fy)
-            | _ -> forces) forces
+        match tree with
+        | None ->
+            for i in 0 .. nodeCount - 1 do
+                for j in i + 1 .. nodeCount - 1 do applyCollision i j
+        | Some root ->
+            let nearby = ResizeArray<int>()
+            for i in 0 .. nodeCount - 1 do
+                nearby.Clear()
+                collectNearby root nodes.[i].X nodes.[i].Y collisionRadius nearby
+                for k in 0 .. nearby.Count - 1 do
+                    let j = nearby.[k]
+                    if i < j then applyCollision i j
 
-    // The function graph has no explicit file nodes, so add a subtle grouping
-    // force based on each function node's source path. This is deliberately
-    // weaker than graph-edge springs: calls can still separate a cluster when
-    // the call structure says they should.
-    let forces =
-        if state.Nodes |> Map.exists (fun _ node -> node.Kind = FunctionNode) then
-            let functionPairs =
-                [ for i in 0 .. nodes.Length - 1 do
-                    for j in i + 1 .. nodes.Length - 1 do
-                        if nodes.[i].Kind = FunctionNode &&
-                           nodes.[j].Kind = FunctionNode &&
-                           nodes.[i].ProjectPath = nodes.[j].ProjectPath &&
-                           nodes.[i].FilePath = nodes.[j].FilePath then
-                            nodes.[i], nodes.[j] ]
-            functionPairs
-            |> List.fold (fun forces (source, target) ->
-                let distance, dirX, dirY = distanceAndDir source.X source.Y target.X target.Y
-                let force = sameFileAttractionStrength * (distance - sameFileAttractionDistance)
-                let fx = dirX * force
-                let fy = dirY * force
-                let sx, sy = Map.find source.Id forces
-                let tx, ty = Map.find target.Id forces
-                forces
-                |> Map.add source.Id (sx + fx, sy + fy)
-                |> Map.add target.Id (tx - fx, ty - fy)) forces
-        else
-            forces
+        // Apply edge springs using direct array indexing rather than Map.find.
+        for (_, edge) in state.Edges |> Map.toArray do
+            if edge.Source <= maxId && edge.Target <= maxId then
+                let sourceIndex = indexById.[edge.Source]
+                let targetIndex = indexById.[edge.Target]
+                if sourceIndex >= 0 && targetIndex >= 0 then
+                    let distance, dirX, dirY = distanceAndDir nodes.[sourceIndex].X nodes.[sourceIndex].Y nodes.[targetIndex].X nodes.[targetIndex].Y
+                    let force = springStrength * (distance - springLength)
+                    let fx, fy = dirX * force, dirY * force
+                    forceX.[sourceIndex] <- forceX.[sourceIndex] + fx
+                    forceY.[sourceIndex] <- forceY.[sourceIndex] + fy
+                    forceX.[targetIndex] <- forceX.[targetIndex] - fx
+                    forceY.[targetIndex] <- forceY.[targetIndex] - fy
 
-    let forces =
-        state.Nodes
-        |> Map.fold (fun forces id node ->
-            let fx = (centerX - node.X) * centeringStrength
-            let fy = (centerY - node.Y) * centeringStrength
-            let currentX, currentY = Map.find id forces
-            Map.add id (currentX + fx, currentY + fy) forces) forces
+        // Pull functions toward a loose centroid for their source file. The
+        // previous implementation applied every same-file pair, which was
+        // quadratic and dominated medium-sized function graphs.
+        nodes
+        |> Array.mapi (fun index node -> index, node)
+        |> Array.groupBy (fun (_, node) ->
+            if node.Kind = FunctionNode then node.ProjectPath + "\u0000" + node.FilePath else "")
+        |> Array.iter (fun (key, members) ->
+            if key <> "" && members.Length > 1 then
+                let centroidX = members |> Array.averageBy (fun (_, node) -> node.X)
+                let centroidY = members |> Array.averageBy (fun (_, node) -> node.Y)
+                for (index, node) in members do
+                    let distance, dirX, dirY = distanceAndDir node.X node.Y centroidX centroidY
+                    let force = sameFileAttractionStrength * (distance - sameFileAttractionDistance)
+                    forceX.[index] <- forceX.[index] + dirX * force
+                    forceY.[index] <- forceY.[index] + dirY * force)
 
-    state.Nodes
-    |> Map.map (fun id node ->
-        if node.Fixed || Set.contains id pinnedNodeIds then
-            { node with Vx = 0.0; Vy = 0.0 }
-        else
-            let fx, fy = Map.find id forces
-            let vx = clamp ((node.Vx + fx * timeStep) * damping) (-maxSpeed) maxSpeed
-            let vy = clamp ((node.Vy + fy * timeStep) * damping) (-maxSpeed) maxSpeed
-            { node with
-                Vx = vx
-                Vy = vy
-                X = node.X + vx * timeStep
-                Y = node.Y + vy * timeStep })
+        // Centering is a single array pass.
+        let centerX = state.CanvasWidth / 2.0
+        let centerY = state.CanvasHeight / 2.0
+        for index in 0 .. nodeCount - 1 do
+            forceX.[index] <- forceX.[index] + (centerX - nodes.[index].X) * centeringStrength
+            forceY.[index] <- forceY.[index] + (centerY - nodes.[index].Y) * centeringStrength
+
+        // Map.map preserves the graph API, but all expensive force accumulation
+        // above uses mutable indexed arrays. Map iteration order matches the
+        // Map.toArray order used to build nodes.
+        let mutable index = 0
+        let nextNodes =
+            state.Nodes
+            |> Map.map (fun _ node ->
+                let current = index
+                index <- index + 1
+                if node.Fixed || Set.contains node.Id pinnedNodeIds then
+                    { node with Vx = 0.0; Vy = 0.0 }
+                else
+                    let vx = clamp ((node.Vx + forceX.[current] * timeStep) * damping) (-maxSpeed) maxSpeed
+                    let vy = clamp ((node.Vy + forceY.[current] * timeStep) * damping) (-maxSpeed) maxSpeed
+                    { node with Vx = vx; Vy = vy; X = node.X + vx * timeStep; Y = node.Y + vy * timeStep })
+        nextNodes

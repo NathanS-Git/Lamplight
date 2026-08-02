@@ -83,6 +83,7 @@ type GraphState = {
     Hovered: Choice<NodeId, EdgeId> option
     Drag: DragState
     PhysicsPaused: bool
+    PhysicsSleeping: bool
     CanvasWidth: float
     CanvasHeight: float
     MouseX: float

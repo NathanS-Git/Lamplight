@@ -58,6 +58,7 @@ let emptyState canvasWidth canvasHeight = {
     Hovered = None
     Drag = NoDrag
     PhysicsPaused = false
+    PhysicsSleeping = false
     CanvasWidth = canvasWidth
     CanvasHeight = canvasHeight
     MouseX = 0.0
@@ -147,7 +148,7 @@ let private arrange preset (state: GraphState) =
                     match Map.tryFind id positions with
                     | Some (x, y) -> { node with X = x; Y = y; Vx = 0.0; Vy = 0.0 }
                     | None -> { node with Vx = 0.0; Vy = 0.0 })
-        { state with Nodes = arranged; Layout = preset; PhysicsPaused = preset <> ForceLayout }
+        { state with Nodes = arranged; Layout = preset; PhysicsPaused = preset <> ForceLayout; PhysicsSleeping = preset <> ForceLayout }
 
 let setLayout preset state =
     arrange preset state
@@ -177,7 +178,7 @@ let private nodesInRect x1 y1 x2 y2 (state: GraphState) =
     |> Set.ofSeq
 
 let physicsStep (state: GraphState) =
-    if state.PhysicsPaused then state
+    if state.PhysicsPaused || state.PhysicsSleeping then state
     else
         let pinned =
             match state.Drag with
@@ -186,11 +187,19 @@ let physicsStep (state: GraphState) =
             | SelectBox _
             | PanCanvas _
             | NoDrag -> Set.empty
-        { state with Nodes = Physics.applyForces state pinned }
+        let nextNodes = Physics.applyForces state pinned
+        let sleeping =
+            nextNodes
+            |> Map.toSeq
+            |> Seq.forall (fun (_, node) -> abs node.Vx < 0.03 && abs node.Vy < 0.03)
+        { state with Nodes = nextNodes; PhysicsSleeping = sleeping }
 
 let resize width height state = { state with CanvasWidth = width; CanvasHeight = height }
 
-let togglePhysics state = { state with PhysicsPaused = not state.PhysicsPaused }
+let togglePhysics state =
+    { state with
+        PhysicsPaused = not state.PhysicsPaused
+        PhysicsSleeping = false }
 
 let private roundedRect (ctx: CanvasRenderingContext2D) x y width height radius =
     let r = min radius (min (width / 2.0) (height / 2.0))
@@ -247,12 +256,11 @@ let private drawArrowHead (ctx: CanvasRenderingContext2D) x1 y1 x2 y2 stroke =
     ctx.fill ()
     ctx.restore ()
 
-let private drawEdge (ctx: CanvasRenderingContext2D) (state: GraphState) (edge: CodeEdge) =
+let private drawEdge (ctx: CanvasRenderingContext2D) (state: GraphState) selectedId (edge: CodeEdge) =
     match Map.tryFind edge.Source state.Nodes, Map.tryFind edge.Target state.Nodes with
     | Some source, Some target ->
         let selected = Set.contains edge.Id state.SelectedEdges
         let hovered = state.Hovered = Some (Choice2Of2 edge.Id)
-        let selectedId = selectedNodeId state
         let incoming = selectedId |> Option.exists (fun id -> edge.Target = id)
         let outgoing = selectedId |> Option.exists (fun id -> edge.Source = id)
         let connected = incoming || outgoing
@@ -298,10 +306,9 @@ let private connectionSets (state: GraphState) =
         let outgoing = state.Edges |> Map.toSeq |> Seq.choose (fun (_, edge) -> if edge.Source = selected then Some edge.Target else None) |> Set.ofSeq
         incoming, outgoing
 
-let private drawNode (ctx: CanvasRenderingContext2D) (state: GraphState) (node: CodeNode) =
+let private drawNode (ctx: CanvasRenderingContext2D) (state: GraphState) selectedId (incoming: Set<NodeId>, outgoing: Set<NodeId>) (node: CodeNode) =
     let selected = Set.contains node.Id state.SelectedNodes
     let hovered = state.Hovered = Some (Choice1Of2 node.Id)
-    let incoming, outgoing = connectionSets state
     let isIncoming = Set.contains node.Id incoming
     let isOutgoing = Set.contains node.Id outgoing
     let dimmed = not (Set.isEmpty state.SelectedNodes) && not selected && not isIncoming && not isOutgoing
@@ -378,8 +385,10 @@ let private drawSelectionBox (ctx: CanvasRenderingContext2D) state =
     | _ -> ()
 
 let private drawGraph (ctx: CanvasRenderingContext2D) (state: GraphState) =
-    state.Edges |> Map.iter (fun _ edge -> drawEdge ctx state edge)
-    state.Nodes |> Map.iter (fun _ node -> drawNode ctx state node)
+    let selectedId = selectedNodeId state
+    let incoming, outgoing = connectionSets state
+    state.Edges |> Map.iter (fun _ edge -> drawEdge ctx state selectedId edge)
+    state.Nodes |> Map.iter (fun _ node -> drawNode ctx state selectedId (incoming, outgoing) node)
     drawSelectionBox ctx state
 
 let private renderLayer (ctx: CanvasRenderingContext2D) (state: GraphState) opacity scale focusX focusY =
