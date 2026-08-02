@@ -14,11 +14,13 @@ let private mutedText = "#94a3b8"
 
 let private nodeWidth (node: CodeNode) =
     match node.Kind with
+    | ProjectNode -> 190.0
     | SourceFileNode -> 168.0
     | FunctionNode -> max 112.0 (min 190.0 (float node.Name.Length * 8.0 + 38.0))
 
 let private nodeHeight (node: CodeNode) =
     match node.Kind with
+    | ProjectNode -> 78.0
     | SourceFileNode -> 70.0
     | FunctionNode -> 54.0
 
@@ -60,6 +62,10 @@ let emptyState canvasWidth canvasHeight = {
     CanvasHeight = canvasHeight
     MouseX = 0.0
     MouseY = 0.0
+    Zoom = 1.0
+    PanX = 0.0
+    PanY = 0.0
+    Layout = ForceLayout
 }
 
 let stateFromGraph width height (nodes: Map<NodeId, CodeNode>) (edges: Map<EdgeId, CodeEdge>) =
@@ -84,8 +90,67 @@ let distPointToSegment px py x1 y1 x2 y2 =
 let hitTestNode x y (state: GraphState) =
     state.Nodes
     |> Map.toSeq
-    |> Seq.sortByDescending (fun (_, node) -> node.Kind = FunctionNode)
+    |> Seq.sortByDescending (fun (_, node) ->
+        match node.Kind with
+        | FunctionNode -> 2
+        | SourceFileNode -> 1
+        | ProjectNode -> 0)
     |> Seq.tryPick (fun (_, node) -> if nodeHit node x y then Some node.Id else None)
+
+let screenToWorld x y (state: GraphState) =
+    let centerX = state.CanvasWidth / 2.0
+    let centerY = state.CanvasHeight / 2.0
+    centerX + (x - centerX - state.PanX) / state.Zoom,
+    centerY + (y - centerY - state.PanY) / state.Zoom
+
+let zoomBy amount state =
+    { state with Zoom = max 0.35 (min 2.5 (state.Zoom * amount)) }
+
+let panBy dx dy state =
+    { state with PanX = state.PanX + dx; PanY = state.PanY + dy }
+
+let recenter state =
+    { state with Zoom = 1.0; PanX = 0.0; PanY = 0.0 }
+
+let private arrange preset (state: GraphState) =
+    let nodes = state.Nodes |> Map.toList |> List.map snd
+    let count = nodes.Length
+    if count = 0 then state
+    else
+        let centerX = state.CanvasWidth / 2.0
+        let centerY = state.CanvasHeight / 2.0
+        let positions =
+            match preset with
+            | RadialLayout ->
+                let radius = min (state.CanvasWidth * 0.36) (state.CanvasHeight * 0.36) |> max 170.0
+                nodes
+                |> List.mapi (fun index node ->
+                    let angle = float index * Math.PI * 2.0 / float count - Math.PI / 2.0
+                    node.Id, (centerX + Math.Cos angle * radius, centerY + Math.Sin angle * radius))
+            | GridLayout ->
+                let columns = max 1 (ceil (sqrt (float count)) |> int)
+                let spacingX = max 190.0 (state.CanvasWidth / float (columns + 1))
+                let rows = (count + columns - 1) / columns
+                let spacingY = max 100.0 (state.CanvasHeight / float (rows + 1))
+                nodes
+                |> List.mapi (fun index node ->
+                    let column = index % columns
+                    let row = index / columns
+                    node.Id, (spacingX * float (column + 1), spacingY * float (row + 1)))
+            | ForceLayout -> []
+        let arranged =
+            positions
+            |> Map.ofList
+            |> fun positions ->
+                state.Nodes
+                |> Map.map (fun id node ->
+                    match Map.tryFind id positions with
+                    | Some (x, y) -> { node with X = x; Y = y; Vx = 0.0; Vy = 0.0 }
+                    | None -> { node with Vx = 0.0; Vy = 0.0 })
+        { state with Nodes = arranged; Layout = preset; PhysicsPaused = preset <> ForceLayout }
+
+let setLayout preset state =
+    arrange preset state
 
 let hitTestEdge x y (state: GraphState) =
     state.Edges
@@ -119,6 +184,7 @@ let physicsStep (state: GraphState) =
             | DragNode _
             | DragSelection _ -> state.SelectedNodes
             | SelectBox _
+            | PanCanvas _
             | NoDrag -> Set.empty
         { state with Nodes = Physics.applyForces state pinned }
 
@@ -186,16 +252,24 @@ let private drawEdge (ctx: CanvasRenderingContext2D) (state: GraphState) (edge: 
     | Some source, Some target ->
         let selected = Set.contains edge.Id state.SelectedEdges
         let hovered = state.Hovered = Some (Choice2Of2 edge.Id)
+        let selectedId = selectedNodeId state
+        let incoming = selectedId |> Option.exists (fun id -> edge.Target = id)
+        let outgoing = selectedId |> Option.exists (fun id -> edge.Source = id)
+        let connected = incoming || outgoing
         let stroke =
-            match edge.Kind with
-            | FileReference -> if selected || hovered then "#5eead4" else "rgba(45, 212, 191, 0.48)"
-            | FunctionCall -> if selected || hovered then "#c4b5fd" else "rgba(167, 139, 250, 0.52)"
+            if incoming then "#fb7185"
+            elif outgoing then "#60a5fa"
+            else
+                match edge.Kind with
+                | ProjectReference -> "rgba(245, 158, 11, 0.52)"
+                | FileReference -> if selected || hovered then "#5eead4" else "rgba(45, 212, 191, 0.48)"
+                | FunctionCall -> if selected || hovered then "#c4b5fd" else "rgba(167, 139, 250, 0.52)"
         let sx, sy = edgePoint source target.X target.Y
         let tx, ty = edgePoint target source.X source.Y
         ctx.save ()
         ctx.strokeStyle <- color stroke
-        ctx.lineWidth <- if selected || hovered then 3.0 else 1.8
-        if edge.Kind = FileReference then ctx.setLineDash [| 7.0; 5.0 |]
+        ctx.lineWidth <- if selected || hovered || connected then 3.0 else 1.8
+        if edge.Kind = FileReference || edge.Kind = ProjectReference then ctx.setLineDash [| 7.0; 5.0 |]
         ctx.beginPath ()
         ctx.moveTo (sx, sy)
         ctx.lineTo (tx, ty)
@@ -216,18 +290,34 @@ let private drawEdge (ctx: CanvasRenderingContext2D) (state: GraphState) (edge: 
         ctx.restore ()
     | _ -> ()
 
+let private connectionSets (state: GraphState) =
+    match selectedNodeId state with
+    | None -> Set.empty, Set.empty
+    | Some selected ->
+        let incoming = state.Edges |> Map.toSeq |> Seq.choose (fun (_, edge) -> if edge.Target = selected then Some edge.Source else None) |> Set.ofSeq
+        let outgoing = state.Edges |> Map.toSeq |> Seq.choose (fun (_, edge) -> if edge.Source = selected then Some edge.Target else None) |> Set.ofSeq
+        incoming, outgoing
+
 let private drawNode (ctx: CanvasRenderingContext2D) (state: GraphState) (node: CodeNode) =
     let selected = Set.contains node.Id state.SelectedNodes
     let hovered = state.Hovered = Some (Choice1Of2 node.Id)
+    let incoming, outgoing = connectionSets state
+    let isIncoming = Set.contains node.Id incoming
+    let isOutgoing = Set.contains node.Id outgoing
+    let dimmed = not (Set.isEmpty state.SelectedNodes) && not selected && not isIncoming && not isOutgoing
     let width = nodeWidth node
     let height = nodeHeight node
     let x = node.X - width / 2.0
     let y = node.Y - height / 2.0
     let accent, fill =
         match node.Kind with
+        | ProjectNode -> "#f59e0b", "#3b2810"
         | SourceFileNode -> fileAccent, "#102b32"
         | FunctionNode -> functionAccent, "#211c3b"
     ctx.save ()
+    if dimmed then ctx.globalAlpha <- 0.22
+    elif isIncoming then ctx.globalAlpha <- 0.86
+    elif isOutgoing then ctx.globalAlpha <- 0.94
     if selected || hovered then
         ctx.shadowColor <- if selected then "rgba(94, 234, 212, 0.45)" else "rgba(167, 139, 250, 0.38)"
         ctx.shadowBlur <- 18.0
@@ -235,8 +325,13 @@ let private drawNode (ctx: CanvasRenderingContext2D) (state: GraphState) (node: 
     ctx.fillStyle <- color fill
     ctx.fill ()
     ctx.shadowBlur <- 0.0
-    ctx.strokeStyle <- color (if selected then "#f8fafc" elif hovered then accent else "rgba(148, 163, 184, 0.48)")
-    ctx.lineWidth <- if selected then 2.5 else 1.5
+    ctx.strokeStyle <- color (
+        if selected then "#f8fafc"
+        elif isIncoming then "#fb7185"
+        elif isOutgoing then "#60a5fa"
+        elif hovered then accent
+        else "rgba(148, 163, 184, 0.48)")
+    ctx.lineWidth <- if selected || isIncoming || isOutgoing then 2.5 else 1.5
     ctx.stroke ()
 
     ctx.fillStyle <- color accent
@@ -244,13 +339,22 @@ let private drawNode (ctx: CanvasRenderingContext2D) (state: GraphState) (node: 
     ctx.arc (x + 17.0, node.Y, 4.0, 0.0, Math.PI * 2.0)
     ctx.fill ()
     ctx.fillStyle <- color textColor
-    ctx.font <- if node.Kind = SourceFileNode then "600 14px sans-serif" else "600 13px sans-serif"
+    ctx.font <-
+        match node.Kind with
+        | ProjectNode -> "600 15px sans-serif"
+        | SourceFileNode -> "600 14px sans-serif"
+        | FunctionNode -> "600 13px sans-serif"
     ctx.textAlign <- "left"
     ctx.textBaseline <- "middle"
-    ctx.fillText (truncate (if node.Kind = SourceFileNode then 20 else 22) node.Name, x + 29.0, node.Y - 9.0)
+    let nameLimit, detailLimit =
+        match node.Kind with
+        | ProjectNode -> 22, 25
+        | SourceFileNode -> 20, 25
+        | FunctionNode -> 22, 27
+    ctx.fillText (truncate nameLimit node.Name, x + 29.0, node.Y - 9.0)
     ctx.fillStyle <- color mutedText
     ctx.font <- "11px sans-serif"
-    ctx.fillText (truncate (if node.Kind = SourceFileNode then 25 else 27) node.Detail, x + 29.0, node.Y + 13.0)
+    ctx.fillText (truncate detailLimit node.Detail, x + 29.0, node.Y + 13.0)
     if node.Fixed then
         ctx.fillStyle <- color accent
         ctx.font <- "10px sans-serif"
@@ -281,8 +385,13 @@ let private drawGraph (ctx: CanvasRenderingContext2D) (state: GraphState) =
 let private renderLayer (ctx: CanvasRenderingContext2D) (state: GraphState) opacity scale focusX focusY =
     ctx.save ()
     ctx.globalAlpha <- opacity
+    let centerX = state.CanvasWidth / 2.0
+    let centerY = state.CanvasHeight / 2.0
+    ctx.translate (centerX + state.PanX, centerY + state.PanY)
+    ctx.scale (scale * state.Zoom, scale * state.Zoom)
+    ctx.translate (-centerX, -centerY)
     ctx.translate (focusX, focusY)
-    ctx.scale (scale, scale)
+    ctx.scale (1.0, 1.0)
     ctx.translate (-focusX, -focusY)
     drawGraph ctx state
     ctx.restore ()
@@ -327,7 +436,12 @@ let handleMouseMove x y state =
         let moved = moveSelectedNodes (x - lastX) (y - lastY) state
         { moved with Drag = DragSelection (x, y) }
     | SelectBox _ -> state
+    | PanCanvas (lastX, lastY) ->
+        { state with PanX = state.PanX + (x - lastX); PanY = state.PanY + (y - lastY); Drag = PanCanvas (x, y) }
     | NoDrag -> { state with Hovered = getHit x y state }
+
+let handleMiddleMouseDown x y state =
+    { state with Drag = PanCanvas (x, y); Hovered = None }
 
 let handleMouseDown x y shift ctrl state =
     match getHit x y state with
@@ -357,4 +471,5 @@ let handleMouseUp x y state =
     | DragNode (_, _, _, origX, origY) ->
         { state with Drag = NoDrag }
     | DragSelection _
+    | PanCanvas _
     | NoDrag -> { state with Drag = NoDrag }

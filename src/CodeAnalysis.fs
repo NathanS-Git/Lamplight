@@ -68,34 +68,37 @@ let private withCalls (allFunctions: CodeFunction list) (fn: CodeFunction) =
     let tokens = tokenPattern.Matches fn.Body |> Seq.cast<Match> |> Seq.map (fun m -> m.Value) |> Set.ofSeq
     { fn with Calls = Set.intersect names tokens |> Set.toList }
 
-let analyzeFile (path: string) (text: string) : SourceFile =
+let private analyzeFileInProject (projectPath: string) (path: string) (text: string) : SourceFile =
     let moduleName = moduleName path text
-    { Path = path
+    { ProjectPath = projectPath
+      Path = path
       Name = fileStem path
       ModuleName = moduleName
       Text = text
       Functions = extractFunctions path moduleName text }
 
-let analyzeFiles (sources: (string * string) list) : SourceFile list =
+let analyzeSourceInputs (sources: SourceInput list) : SourceFile list =
     let files =
         sources
-        |> List.filter (fun (path, _) ->
-            let normalized = path.Replace("\\", "/")
+        |> List.filter (fun source ->
+            let normalized = source.Path.Replace("\\", "/")
             let lower = normalized.ToLowerInvariant()
             (lower.EndsWith(".fs") || lower.EndsWith(".fsx")) &&
             not (lower.Contains("/obj/")) &&
             not (lower.Contains("/bin/")) &&
             not (lower.Contains("/node_modules/")) &&
             not (lower.Contains("/fable_modules/")))
-        |> List.sortBy fst
-        |> List.map (fun (path, text) -> analyzeFile path text)
+        |> List.sortBy (fun source -> source.Project, source.Path)
+        |> List.map (fun source -> analyzeFileInProject source.Project source.Path source.Text)
 
     let allFunctions = files |> List.collect (fun file -> file.Functions)
-    let files =
-        files
-        |> List.map (fun file -> { file with Functions = file.Functions |> List.map (withCalls allFunctions) })
-
     files
+    |> List.map (fun file -> { file with Functions = file.Functions |> List.map (withCalls allFunctions) })
+
+let analyzeFiles (sources: (string * string) list) : SourceFile list =
+    sources
+    |> List.map (fun (path, text) -> { Project = ""; Path = path; Text = text })
+    |> analyzeSourceInputs
 
 let private containsSymbol (text: string) symbol =
     Regex.IsMatch(text, "(?<![A-Za-z0-9_'])" + Regex.Escape symbol + "(?![A-Za-z0-9_'])")
@@ -118,12 +121,13 @@ let private initialPosition index count width height =
     width / 2.0 + Math.Cos angle * radius,
     height / 2.0 + Math.Sin angle * radius
 
-let private createNode (kind: NodeKind) id name detail path line sourceCode index count width height : CodeNode =
+let private createNode (kind: NodeKind) id name detail projectPath path line sourceCode index count width height : CodeNode =
     let x, y = initialPosition index count width height
     { Id = id
       Kind = kind
       Name = name
       Detail = detail
+      ProjectPath = projectPath
       FilePath = path
       Line = line
       SourceCode = sourceCode
@@ -131,15 +135,45 @@ let private createNode (kind: NodeKind) id name detail path line sourceCode inde
       Y = y
       Vx = 0.0
       Vy = 0.0
-      Radius = if kind = SourceFileNode then 54.0 else 34.0
+      Radius =
+          match kind with
+          | ProjectNode -> 62.0
+          | SourceFileNode -> 54.0
+          | FunctionNode -> 34.0
       Fixed = false }
+
+let buildProjectGraph (projects: ProjectInfo list) width height =
+    let count = List.length projects
+    let nodes =
+        projects
+        |> List.mapi (fun index project ->
+            let detail = sprintf "%d references" project.References.Length
+            let node = createNode ProjectNode index project.Name detail project.Name project.Path None None index count width height
+            index, node)
+        |> Map.ofList
+    let idsByName = projects |> List.mapi (fun index project -> project.Name, index) |> Map.ofList
+    let edges =
+        projects
+        |> List.mapi (fun sourceIndex project -> sourceIndex, project)
+        |> List.collect (fun (sourceIndex, project) ->
+            project.References
+            |> List.choose (fun targetName ->
+                match Map.tryFind targetName idsByName with
+                | Some targetIndex when sourceIndex <> targetIndex ->
+                    Some (sourceIndex, targetIndex, sprintf "%s references %s" project.Name targetName)
+                | _ -> None))
+        |> List.distinct
+        |> List.mapi (fun edgeId (source, target, label) ->
+            edgeId, { Id = edgeId; Kind = ProjectReference; Source = source; Target = target; Label = label })
+        |> Map.ofList
+    nodes, edges
 
 let buildFileGraph (files: SourceFile list) width height =
     let count = List.length files
     let nodes =
         files
         |> List.mapi (fun index file ->
-            let node = createNode SourceFileNode index file.Name (sprintf "%d functions" file.Functions.Length) file.Path None None index count width height
+            let node = createNode SourceFileNode index file.Name (sprintf "%d functions" file.Functions.Length) file.ProjectPath file.Path None None index count width height
             index, node)
         |> Map.ofList
     let edges =
@@ -157,11 +191,13 @@ let buildFileGraph (files: SourceFile list) width height =
 let buildFunctionGraph (files: SourceFile list) width height =
     let functions = files |> List.collect (fun file -> file.Functions)
     let count = List.length functions
+    let projectPathByFile = files |> List.map (fun file -> file.Path, file.ProjectPath) |> Map.ofList
     let nodes =
         functions
         |> List.mapi (fun index fn ->
+            let projectPath = Map.tryFind fn.FilePath projectPathByFile |> Option.defaultValue ""
             let detail = sprintf "%s  ·  line %d" (lastPathPart fn.FilePath) fn.Line
-            let node = createNode FunctionNode index fn.Name detail fn.FilePath (Some fn.Line) (Some fn.Body) index count width height
+            let node = createNode FunctionNode index fn.Name detail projectPath fn.FilePath (Some fn.Line) (Some fn.Body) index count width height
             index, node)
         |> Map.ofList
     let idsByName =

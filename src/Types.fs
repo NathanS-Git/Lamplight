@@ -4,12 +4,31 @@ type NodeId = int
 type EdgeId = int
 
 type NodeKind =
+    | ProjectNode
     | SourceFileNode
     | FunctionNode
 
 type EdgeKind =
+    | ProjectReference
     | FileReference
     | FunctionCall
+
+type LayoutPreset =
+    | ForceLayout
+    | RadialLayout
+    | GridLayout
+
+type ProjectInfo = {
+    Name: string
+    Path: string
+    References: string list
+}
+
+type SourceInput = {
+    Project: string
+    Path: string
+    Text: string
+}
 
 type CodeFunction = {
     Name: string
@@ -21,6 +40,7 @@ type CodeFunction = {
 }
 
 type SourceFile = {
+    ProjectPath: string
     Path: string
     Name: string
     ModuleName: string
@@ -33,6 +53,7 @@ type CodeNode = {
     Kind: NodeKind
     Name: string
     Detail: string
+    ProjectPath: string
     FilePath: string
     Line: int option
     SourceCode: string option
@@ -66,6 +87,10 @@ type GraphState = {
     CanvasHeight: float
     MouseX: float
     MouseY: float
+    Zoom: float
+    PanX: float
+    PanY: float
+    Layout: LayoutPreset
 }
 
 and DragState =
@@ -73,3 +98,4 @@ and DragState =
     | DragNode of NodeId * offsetX: float * offsetY: float * origMouseX: float * origMouseY: float
     | DragSelection of offsetX: float * offsetY: float
     | SelectBox of startX: float * startY: float
+    | PanCanvas of lastX: float * lastY: float

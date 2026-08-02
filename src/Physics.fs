@@ -9,8 +9,8 @@ open Types
 // Keep cards separated enough that labels remain readable, especially in the
 // denser function view. The graph is still intentionally loose rather than
 // trying to pack every node into the viewport.
-let repulsionStrength = 7600.0
-let springLength = 185.0
+let repulsionStrength = 20000.0
+let springLength = 200.0
 let springStrength = 0.035
 
 // Function nodes belonging to one source file get a weak long-range cohesion
@@ -24,7 +24,7 @@ let sameFileAttractionStrength = 0.008
 // starts fading in before cards get close, rather than imposing a rigid wall.
 // The wider influence radius creates breathing room without making the layout
 // feel overly springy or explosive.
-let collisionGap = 105.0
+let collisionGap = 200.0
 let collisionInfluenceScale = 1.35
 let collisionStrength = 0.22
 
@@ -32,6 +32,14 @@ let damping = 0.90
 let centeringStrength = 0.0025
 let maxSpeed = 24.0
 let timeStep = 0.5
+
+// Barnes-Hut approximation settings. A cell is treated as one aggregate mass
+// when it is sufficiently far away; nearby cells are opened so local spacing
+// remains accurate. This changes the expensive all-pairs repulsion from O(n²)
+// to approximately O(n log n) for larger function graphs.
+let private barnesHutTheta = 0.62
+let private quadBucketSize = 4
+let private quadMaxDepth = 14
 
 let private clamp value minValue maxValue =
     max minValue (min maxValue value)
@@ -45,13 +53,125 @@ let private distanceAndDir x1 y1 x2 y2 =
     else
         distance, dx / distance, dy / distance
 
+type private QuadCell(minX: float, minY: float, maxX: float, maxY: float, depth: int) =
+    let mutable points: CodeNode list = []
+    let mutable children: QuadCell array option = None
+    let mutable mass = 0.0
+    let mutable centerX = 0.0
+    let mutable centerY = 0.0
+
+    member _.MinX = minX
+    member _.MinY = minY
+    member _.MaxX = maxX
+    member _.MaxY = maxY
+    member _.Size = maxX - minX
+    member _.Points = points
+    member _.Children = children
+    member _.Mass = mass
+    member _.CenterX = centerX
+    member _.CenterY = centerY
+
+    member private this.ChildIndex x y =
+        let midX = (minX + maxX) / 2.0
+        let midY = (minY + maxY) / 2.0
+        if y < midY then
+            if x < midX then 0 else 1
+        elif x < midX then 2
+        else 3
+
+    member private this.Subdivide() =
+        let midX = (minX + maxX) / 2.0
+        let midY = (minY + maxY) / 2.0
+        children <- Some [|
+            QuadCell(minX, minY, midX, midY, depth + 1)
+            QuadCell(midX, minY, maxX, midY, depth + 1)
+            QuadCell(minX, midY, midX, maxY, depth + 1)
+            QuadCell(midX, midY, maxX, maxY, depth + 1)
+        |]
+        let existing = points
+        points <- []
+        for point in existing do this.Insert point
+
+    member this.Insert (point: CodeNode) =
+        match children with
+        | Some cells -> cells.[this.ChildIndex point.X point.Y].Insert point
+        | None when points.Length < quadBucketSize || depth >= quadMaxDepth ->
+            points <- point :: points
+        | None ->
+            this.Subdivide()
+            this.Insert point
+
+    member this.UpdateMass() =
+        match children with
+        | None ->
+            mass <- float points.Length
+            if mass > 0.0 then
+                centerX <- points |> List.averageBy (fun point -> point.X)
+                centerY <- points |> List.averageBy (fun point -> point.Y)
+            else
+                centerX <- (minX + maxX) / 2.0
+                centerY <- (minY + maxY) / 2.0
+        | Some cells ->
+            for cell in cells do cell.UpdateMass ()
+            mass <- cells |> Array.sumBy (fun cell -> cell.Mass)
+            if mass > 0.0 then
+                centerX <- (cells |> Array.sumBy (fun (cell: QuadCell) -> cell.CenterX * cell.Mass)) / mass
+                centerY <- (cells |> Array.sumBy (fun (cell: QuadCell) -> cell.CenterY * cell.Mass)) / mass
+            else
+                centerX <- (minX + maxX) / 2.0
+                centerY <- (minY + maxY) / 2.0
+
+let private buildQuadTree (nodes: CodeNode list) =
+    let minX = nodes |> List.map (fun node -> node.X) |> List.min
+    let maxX = nodes |> List.map (fun node -> node.X) |> List.max
+    let minY = nodes |> List.map (fun node -> node.Y) |> List.min
+    let maxY = nodes |> List.map (fun node -> node.Y) |> List.max
+    let lower = min minX minY
+    let upper = max maxX maxY
+    let span = max 1.0 (upper - lower)
+    let root = QuadCell(lower, lower, lower + span, lower + span, 0)
+    for node in nodes do root.Insert node
+    root.UpdateMass ()
+    root
+
+let private addForce id fx fy forces =
+    let currentX, currentY = Map.find id forces
+    Map.add id (currentX + fx, currentY + fy) forces
+
+let private applyQuadRepulsion (root: QuadCell) (source: CodeNode) forces =
+    let rec visit (cell: QuadCell) forces =
+        if cell.Mass = 0.0 then
+            forces
+        else
+            let distance, dirX, dirY = distanceAndDir source.X source.Y cell.CenterX cell.CenterY
+            let containsSource =
+                source.X >= cell.MinX && source.X <= cell.MaxX &&
+                source.Y >= cell.MinY && source.Y <= cell.MaxY
+            match cell.Children with
+            | None ->
+                cell.Points
+                |> List.fold (fun forces target ->
+                    if target.Id = source.Id then forces
+                    else
+                        let distance, dirX, dirY = distanceAndDir source.X source.Y target.X target.Y
+                        let force = repulsionStrength / (distance * distance + 1.0)
+                        addForce source.Id (-dirX * force) (-dirY * force) forces) forces
+            | Some cells when not containsSource && cell.Size / distance < barnesHutTheta ->
+                let force = repulsionStrength * cell.Mass / (distance * distance + 1.0)
+                addForce source.Id (-dirX * force) (-dirY * force) forces
+            | Some cells ->
+                cells |> Array.fold (fun forces child -> visit child forces) forces
+    visit root forces
+
 let private nodeWidth (node: CodeNode) =
     match node.Kind with
+    | ProjectNode -> 190.0
     | SourceFileNode -> 168.0
     | FunctionNode -> max 112.0 (min 190.0 (float node.Name.Length * 8.0 + 38.0))
 
 let private nodeHeight (node: CodeNode) =
     match node.Kind with
+    | ProjectNode -> 78.0
     | SourceFileNode -> 70.0
     | FunctionNode -> 54.0
 
@@ -81,7 +201,15 @@ let applyForces (state: GraphState) (pinnedNodeIds: Set<NodeId>) =
             for j in i + 1 .. nodes.Length - 1 do
                 nodes.[i], nodes.[j] ]
 
-    let forces = repel pairs initialForces
+    // Build the spatial index once per physics tick. The tree is only needed
+    // while the layout is moving; GraphEditor avoids calling this function
+    // entirely when physics is paused.
+    let forces =
+        if List.length nodes < 24 then
+            repel pairs initialForces
+        else
+            let tree = buildQuadTree nodes
+            nodes |> List.fold (fun forces node -> applyQuadRepulsion tree node forces) initialForces
 
     // Push overlapping rendered rectangles apart. Unlike inverse-square
     // point repulsion, this remains strong while cards overlap and therefore
@@ -140,6 +268,7 @@ let applyForces (state: GraphState) (pinnedNodeIds: Set<NodeId>) =
                     for j in i + 1 .. nodes.Length - 1 do
                         if nodes.[i].Kind = FunctionNode &&
                            nodes.[j].Kind = FunctionNode &&
+                           nodes.[i].ProjectPath = nodes.[j].ProjectPath &&
                            nodes.[i].FilePath = nodes.[j].FilePath then
                             nodes.[i], nodes.[j] ]
             functionPairs

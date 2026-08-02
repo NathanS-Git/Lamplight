@@ -10,6 +10,7 @@ open CodeAnalysis
 open GraphEditor
 
 type GraphLevel =
+    | ProjectsLevel
     | FilesLevel
     | FunctionsLevel
 
@@ -25,7 +26,9 @@ type ViewTransition = {
 
 let mutable state = emptyState 800.0 600.0
 let mutable sourceFiles: SourceFile list = []
+let mutable projects: ProjectInfo list = []
 let mutable level = FilesLevel
+let mutable selectedProjectPath: string option = None
 let mutable selectedFilePath: string option = None
 let mutable viewTransition: ViewTransition option = None
 let mutable animationTime = 0.0
@@ -154,14 +157,17 @@ let private easeInOut t =
     if t < 0.5 then 4.0 * t * t * t else 1.0 - Math.Pow (-2.0 * t + 2.0, 3.0) / 2.0
 
 let private projectLabel () =
-    match sourceFiles with
-    | [] -> "No project loaded"
-    | first :: _ ->
-        let parts = first.Path.Replace("\\", "/").Split('/')
-        if parts.Length > 1 then parts.[0] else "F# project"
+    match selectedProjectPath, sourceFiles with
+    | Some path, _ -> path
+    | None, first :: _ -> first.ProjectPath
+    | None, [] -> "No project loaded"
 
 let private graphStats () =
-    let nodeLabel = if level = FilesLevel then "files" else "functions"
+    let nodeLabel =
+        match level with
+        | ProjectsLevel -> "projects"
+        | FilesLevel -> "files"
+        | FunctionsLevel -> "functions"
     sprintf "%d %s  /  %d edges" state.Nodes.Count nodeLabel state.Edges.Count
 
 let private functionScope () =
@@ -184,6 +190,30 @@ let private jsonSourcePath (value: obj) (index: int) : string = jsNative
 [<Emit("$0[$1].Text")>]
 let private jsonSourceText (value: obj) (index: int) : string = jsNative
 
+[<Emit("$0[$1].Project")>]
+let private jsonSourceProject (value: obj) (index: int) : string = jsNative
+
+[<Emit("$0.Projects")>]
+let private jsonProjects (value: obj) : obj = jsNative
+
+[<Emit("$0.Sources")>]
+let private jsonSources (value: obj) : obj = jsNative
+
+[<Emit("$0[$1].Name")>]
+let private jsonProjectName (value: obj) (index: int) : string = jsNative
+
+[<Emit("$0[$1].Path")>]
+let private jsonProjectPath (value: obj) (index: int) : string = jsNative
+
+[<Emit("$0[$1].References")>]
+let private jsonProjectReferences (value: obj) (index: int) : obj = jsNative
+
+[<Emit("$0[$1]")>]
+let private jsonArrayItem (value: obj) (index: int) : string = jsNative
+
+[<Emit("$0.length")>]
+let private jsonArrayLength (value: obj) : int = jsNative
+
 let private updateInspector () =
     inspector.innerHTML <- ""
     let selected = state.SelectedNodes |> Set.toList
@@ -191,9 +221,16 @@ let private updateInspector () =
         let nodeId = List.head selected
         match Map.tryFind nodeId state.Nodes with
         | Some node ->
-            inspector.appendChild (createLabel (if node.Kind = SourceFileNode then "SOURCE FILE" else "FUNCTION") "display:block;color:#5eead4;font:700 10px sans-serif;letter-spacing:1.4px;margin-bottom:9px;") |> ignore
+            let kindLabel =
+                match node.Kind with
+                | ProjectNode -> "PROJECT"
+                | SourceFileNode -> "SOURCE FILE"
+                | FunctionNode -> "FUNCTION"
+            inspector.appendChild (createLabel kindLabel "display:block;color:#5eead4;font:700 10px sans-serif;letter-spacing:1.4px;margin-bottom:9px;") |> ignore
             inspector.appendChild (createLabel node.Name "display:block;color:#f8fafc;font:600 18px sans-serif;margin-bottom:6px;overflow-wrap:anywhere;") |> ignore
             inspector.appendChild (createLabel node.Detail "display:block;color:#94a3b8;font:12px sans-serif;line-height:1.5;margin-bottom:9px;overflow-wrap:anywhere;") |> ignore
+            if node.ProjectPath <> "" then
+                inspector.appendChild (createLabel node.ProjectPath "display:block;color:#64748b;font:11px monospace;line-height:1.4;overflow-wrap:anywhere;") |> ignore
             if node.FilePath <> "" then
                 inspector.appendChild (createLabel node.FilePath "display:block;color:#64748b;font:11px monospace;line-height:1.4;overflow-wrap:anywhere;") |> ignore
             match node.Line with
@@ -220,6 +257,25 @@ let private updateInspector () =
         inspector.appendChild (createLabel "function calls" "display:block;color:#64748b;font:11px sans-serif;margin-bottom:9px;") |> ignore
         inspector.appendChild (createLabel "Drag nodes to tune the layout. Double-click a file node to descend one layer." "display:block;color:#94a3b8;font:12px sans-serif;line-height:1.5;") |> ignore
 
+let private navigateToProjects () =
+    let oldState = state
+    let nodes, edges = buildProjectGraph projects state.CanvasWidth state.CanvasHeight
+    state <- stateFromGraph state.CanvasWidth state.CanvasHeight nodes edges
+    level <- ProjectsLevel
+    selectedProjectPath <- None
+    selectedFilePath <- None
+    beginViewTransition oldState state (state.CanvasWidth / 2.0) (state.CanvasHeight / 2.0) 62.0 false
+
+let private navigateToFiles projectPath =
+    let files = sourceFiles |> List.filter (fun file -> file.ProjectPath = projectPath)
+    let nodes, edges = buildFileGraph files state.CanvasWidth state.CanvasHeight
+    let nextState = stateFromGraph state.CanvasWidth state.CanvasHeight nodes edges
+    beginViewTransition state nextState (state.CanvasWidth / 2.0) (state.CanvasHeight / 2.0) 62.0 true
+    state <- nextState
+    level <- FilesLevel
+    selectedProjectPath <- Some projectPath
+    selectedFilePath <- None
+
 let rec updateToolbar () =
     toolbar.innerHTML <- ""
     setStyles toolbar "position:relative;z-index:3;box-sizing:border-box;min-height:72px;padding:14px 20px;border-bottom:1px solid rgba(148,163,184,.16);background:rgba(8,17,31,.94);display:flex;align-items:center;gap:10px;font-family:sans-serif;"
@@ -230,50 +286,80 @@ let rec updateToolbar () =
     titleGroup.appendChild (createLabel "F# code atlas" "color:#64748b;font:11px sans-serif;letter-spacing:1px;text-transform:uppercase;") |> ignore
     toolbar.appendChild titleGroup |> ignore
 
-    if not (List.isEmpty sourceFiles) then
+    if not (List.isEmpty projects) then
         let backButton = createButton "Back" false (fun () ->
-            if level = FunctionsLevel then
-                let oldState = state
-                let nodes, edges = buildFileGraph sourceFiles state.CanvasWidth state.CanvasHeight
-                let nextState = stateFromGraph state.CanvasWidth state.CanvasHeight nodes edges
-                beginViewTransition oldState nextState (state.CanvasWidth / 2.0) (state.CanvasHeight / 2.0) 54.0 false
-                state <- nextState
-                level <- FilesLevel
-                selectedFilePath <- None
-                updateToolbar ()
-                updateInspector ())
-        if level = FilesLevel then
+            match level with
+            | FunctionsLevel ->
+                match selectedProjectPath with
+                | Some projectPath -> navigateToFiles projectPath
+                | None -> navigateToProjects ()
+            | FilesLevel -> navigateToProjects ()
+            | ProjectsLevel -> ())
+        if level = ProjectsLevel then
             backButton.setAttribute ("disabled", "true")
             setStyles backButton "height:34px;padding:0 12px;margin:0 5px 0 0;cursor:default;border:1px solid rgba(148,163,184,.14);border-radius:8px;background:rgba(15,23,42,.45);color:#475569;font:600 12px sans-serif;"
         toolbar.appendChild backButton |> ignore
 
-        let currentButton = createButton (if level = FilesLevel then "Files" else "Functions") (level = FilesLevel) (fun () -> ())
+        let currentButton = createButton (match level with | ProjectsLevel -> "Projects" | FilesLevel -> "Files" | FunctionsLevel -> "Functions") (level = ProjectsLevel) (fun () -> ())
         toolbar.appendChild currentButton |> ignore
         let pauseButton = createButton (if state.PhysicsPaused then "Resume layout" else "Pause layout") false (fun () -> state <- togglePhysics state; updateToolbar ())
         toolbar.appendChild pauseButton |> ignore
+        let radialButton = createButton "Radial" (state.Layout = RadialLayout) (fun () -> state <- setLayout RadialLayout state; updateToolbar ())
+        let gridButton = createButton "Grid" (state.Layout = GridLayout) (fun () -> state <- setLayout GridLayout state; updateToolbar ())
+        let forceButton = createButton "Force" (state.Layout = ForceLayout) (fun () -> state <- setLayout ForceLayout state; updateToolbar ())
+        toolbar.appendChild radialButton |> ignore
+        toolbar.appendChild gridButton |> ignore
+        toolbar.appendChild forceButton |> ignore
+        let zoomOut = createButton "−" false (fun () -> state <- zoomBy 0.85 state)
+        let zoomIn = createButton "+" false (fun () -> state <- zoomBy 1.18 state)
+        let center = createButton "Recenter" false (fun () -> state <- recenter state)
+        toolbar.appendChild zoomOut |> ignore
+        toolbar.appendChild zoomIn |> ignore
+        toolbar.appendChild center |> ignore
 
     let project = createLabel (sprintf "%s  ·  %s" (projectLabel ()) (graphStats ())) "color:#64748b;font:11px monospace;white-space:nowrap;margin-left:8px;"
     toolbar.appendChild project |> ignore
 
+    let breadcrumbs = document.createElement ("div")
+    setStyles breadcrumbs "position:absolute;left:20px;top:76px;z-index:2;color:#94a3b8;font:11px monospace;pointer-events:none;"
+    let breadcrumbText =
+        match level, selectedProjectPath, selectedFilePath with
+        | ProjectsLevel, _, _ -> "Projects"
+        | FilesLevel, Some projectPath, _ -> sprintf "Projects  /  %s  /  Files" projectPath
+        | FunctionsLevel, Some projectPath, Some filePath -> sprintf "Projects  /  %s  /  Files  /  %s  /  Functions" projectPath filePath
+        | _ -> "Files"
+    breadcrumbs.innerText <- breadcrumbText
+    toolbar.appendChild breadcrumbs |> ignore
+
     status.innerText <-
-        if List.isEmpty sourceFiles then "Run: npm run run -- /path/to/your/fsharp-project"
+        if List.isEmpty sourceFiles then "Run: npm run run -- /path/to/your/fsharp-project [other-project]"
+        elif level = ProjectsLevel then "Double-click a project node to descend into its files."
         elif level = FilesLevel then "Double-click a file node to descend into its functions."
         else sprintf "Function graph across the loaded project. %s. Use Back to return to files." (functionScope ())
-    setStyles status "position:absolute;left:20px;top:76px;z-index:2;color:#64748b;font:11px sans-serif;pointer-events:none;"
+    setStyles status "position:absolute;left:20px;top:94px;z-index:2;color:#64748b;font:11px sans-serif;pointer-events:none;"
     updateInspector ()
 
-let private loadSources (sources: (string * string) list) =
-    let analyzed = analyzeFiles sources
+let private loadSources (projectInfos: ProjectInfo list) (sources: SourceInput list) =
+    let analyzed = analyzeSourceInputs sources
+    projects <- projectInfos
+    sourceFiles <- analyzed
     if List.isEmpty analyzed then
-        sourceFiles <- []
         state <- emptyState state.CanvasWidth state.CanvasHeight
         level <- FilesLevel
+        selectedProjectPath <- None
+        selectedFilePath <- None
+    elif projectInfos.Length > 1 then
+        let nodes, edges = buildProjectGraph projectInfos state.CanvasWidth state.CanvasHeight
+        state <- stateFromGraph state.CanvasWidth state.CanvasHeight nodes edges
+        level <- ProjectsLevel
+        selectedProjectPath <- None
         selectedFilePath <- None
     else
-        sourceFiles <- analyzed
+        let projectPath = projectInfos |> List.tryHead |> Option.map (fun project -> project.Path) |> Option.defaultValue ""
         let nodes, edges = buildFileGraph analyzed state.CanvasWidth state.CanvasHeight
         state <- stateFromGraph state.CanvasWidth state.CanvasHeight nodes edges
         level <- FilesLevel
+        selectedProjectPath <- Some projectPath
         selectedFilePath <- None
     viewTransition <- None
     updateToolbar ()
@@ -282,26 +368,38 @@ let private loadAnalysis () =
     status.innerText <- "Loading CLI analysis..."
     try
         let parsed = fetchTextSync "analysis.json" |> parseJson
-        let count = jsonLength parsed
+        let projectValues = jsonProjects parsed
+        let projectCount = jsonArrayLength projectValues
+        let projectInfos =
+            [ for index in 0 .. projectCount - 1 do
+                let referencesValue = jsonProjectReferences projectValues index
+                let referenceCount = jsonArrayLength referencesValue
+                let references = [ for referenceIndex in 0 .. referenceCount - 1 do yield jsonArrayItem referencesValue referenceIndex ]
+                yield { Name = jsonProjectName projectValues index; Path = jsonProjectPath projectValues index; References = references } ]
+        let sourceValues = jsonSources parsed
+        let sourceCount = jsonArrayLength sourceValues
         let sources =
-            [ for index in 0 .. count - 1 do
-                yield jsonSourcePath parsed index, jsonSourceText parsed index ]
-        if List.isEmpty sources then
-            status.innerText <- "CLI analysis contained no F# files."
-        else
-            loadSources sources
+            [ for index in 0 .. sourceCount - 1 do
+                yield { Project = jsonSourceProject sourceValues index; Path = jsonSourcePath sourceValues index; Text = jsonSourceText sourceValues index } ]
+        if List.isEmpty sources then status.innerText <- "CLI analysis contained no F# files."
+        else loadSources projectInfos sources
     with ex ->
         status.innerText <- sprintf "No CLI analysis found: %s" ex.Message
 
 let private enterFunctionLayer nodeId =
     match level, Map.tryFind nodeId state.Nodes with
+    | ProjectsLevel, Some projectNode when projectNode.Kind = ProjectNode ->
+        navigateToFiles projectNode.ProjectPath
+        updateToolbar ()
     | FilesLevel, Some fileNode when fileNode.Kind = SourceFileNode ->
         let oldState = state
-        let nodes, edges = buildFunctionGraph sourceFiles state.CanvasWidth state.CanvasHeight
+        let projectFiles = sourceFiles |> List.filter (fun file -> file.ProjectPath = fileNode.ProjectPath)
+        let nodes, edges = buildFunctionGraph projectFiles state.CanvasWidth state.CanvasHeight
         let nextState = stateFromGraph state.CanvasWidth state.CanvasHeight nodes edges
         beginViewTransition oldState nextState fileNode.X fileNode.Y fileNode.Radius true
         state <- nextState
         level <- FunctionsLevel
+        selectedProjectPath <- Some fileNode.ProjectPath
         selectedFilePath <- Some fileNode.FilePath
         updateToolbar ()
     | _ -> ()
@@ -347,30 +445,51 @@ let private init () =
     let ctx = canvas.getContext_2d ()
     canvas.onmousemove <- fun ev ->
         let x, y = getMousePos ev
-        state <- handleMouseMove x y state
+        let worldX, worldY = screenToWorld x y state
+        state <-
+            match state.Drag with
+            | PanCanvas _ -> handleMouseMove x y state
+            | _ -> handleMouseMove worldX worldY state
     canvas.onmousedown <- fun ev ->
         let x, y = getMousePos ev
-        state <- handleMouseDown x y ev.shiftKey ev.ctrlKey state
-        updateInspector ()
+        if ev.button = 1 then
+            ev.preventDefault ()
+            state <- handleMiddleMouseDown x y state
+        elif ev.button = 0 then
+            let worldX, worldY = screenToWorld x y state
+            state <- handleMouseDown worldX worldY ev.shiftKey ev.ctrlKey state
+            updateInspector ()
+        else
+            ()
     canvas.onmouseup <- fun ev ->
         let x, y = getMousePos ev
-        state <- handleMouseUp x y state
-        updateInspector ()
+        if ev.button = 1 then
+            ev.preventDefault ()
+            state <- handleMouseUp x y state
+        else
+            let worldX, worldY = screenToWorld x y state
+            state <- handleMouseUp worldX worldY state
+            updateInspector ()
     canvas.onmouseleave <- fun _ -> state <- { state with Hovered = None; Drag = NoDrag }
+    canvas.oncontextmenu <- fun ev -> ev.preventDefault ()
+    canvas.onwheel <- fun ev ->
+        state <- zoomBy (if ev.deltaY < 0.0 then 1.08 else 0.93) state
     canvas.ondblclick <- fun ev ->
         let x, y = getMousePos ev
-        match hitTestNode x y state with
+        let worldX, worldY = screenToWorld x y state
+        match hitTestNode worldX worldY state with
         | Some nodeId -> enterFunctionLayer nodeId
         | None -> ()
     document.onkeydown <- fun ev ->
-        if ev.key = "Escape" && level = FunctionsLevel then
-            let oldState = state
-            let nodes, edges = buildFileGraph sourceFiles state.CanvasWidth state.CanvasHeight
-            state <- stateFromGraph state.CanvasWidth state.CanvasHeight nodes edges
-            level <- FilesLevel
-            selectedFilePath <- None
-            beginViewTransition oldState state (state.CanvasWidth / 2.0) (state.CanvasHeight / 2.0) 54.0 false
-            updateToolbar ()
+        if ev.key = "Escape" then
+            match level with
+            | FunctionsLevel ->
+                match selectedProjectPath with
+                | Some projectPath -> navigateToFiles projectPath
+                | None -> navigateToProjects ()
+                updateToolbar ()
+            | FilesLevel when projects.Length > 1 -> navigateToProjects (); updateToolbar ()
+            | _ -> ()
     window.onresize <- fun _ -> applyResize ()
 
     applyResize ()
