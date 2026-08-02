@@ -473,7 +473,9 @@ let private init () =
     canvas.onmouseleave <- fun _ -> state <- { state with Hovered = None; Drag = NoDrag }
     canvas.oncontextmenu <- fun ev -> ev.preventDefault ()
     canvas.onwheel <- fun ev ->
-        state <- zoomBy (if ev.deltaY < 0.0 then 1.08 else 0.93) state
+        ev.preventDefault ()
+        let x, y = getMousePos ev
+        state <- zoomAt (if ev.deltaY < 0.0 then 1.08 else 0.93) x y state
     canvas.ondblclick <- fun ev ->
         let x, y = getMousePos ev
         let worldX, worldY = screenToWorld x y state

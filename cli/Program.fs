@@ -77,7 +77,9 @@ let private readProject path =
             |> Seq.map (fun m -> Path.GetFileNameWithoutExtension m.Groups.[1].Value)
             |> Seq.toList
         | None -> []
-    let info = { Name = name; Path = root |> Path.GetFullPath; References = references }
+    // Use the normalized root path as the stable identity in both project
+    // metadata and source inputs. This keeps drill-down portable across OSes.
+    let info = { Name = name; Path = projectId; References = references }
     { Info = info; Sources = readSources root projectId }
 
 let private findPublicDirectory () =

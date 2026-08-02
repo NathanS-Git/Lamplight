@@ -148,7 +148,9 @@ let buildProjectGraph (projects: ProjectInfo list) width height =
         projects
         |> List.mapi (fun index project ->
             let detail = sprintf "%d references" project.References.Length
-            let node = createNode ProjectNode index project.Name detail project.Name project.Path None None index count width height
+            // ProjectPath must use the same stable identity as SourceInput.Project
+            // so project-level drill-down can find its files.
+            let node = createNode ProjectNode index project.Name detail project.Path project.Path None None index count width height
             index, node)
         |> Map.ofList
     let idsByName = projects |> List.mapi (fun index project -> project.Name, index) |> Map.ofList

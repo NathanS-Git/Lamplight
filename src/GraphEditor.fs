@@ -107,6 +107,19 @@ let screenToWorld x y (state: GraphState) =
 let zoomBy amount state =
     { state with Zoom = max 0.35 (min 2.5 (state.Zoom * amount)) }
 
+// Change zoom while keeping the world point currently under the cursor fixed
+// on screen. Without this compensation, zooming always pulls toward the
+// viewport center, which feels disconnected from the user's pointer.
+let zoomAt amount screenX screenY state =
+    let centerX = state.CanvasWidth / 2.0
+    let centerY = state.CanvasHeight / 2.0
+    let worldX, worldY = screenToWorld screenX screenY state
+    let nextZoom = max 0.35 (min 2.5 (state.Zoom * amount))
+    { state with
+        Zoom = nextZoom
+        PanX = screenX - centerX - (worldX - centerX) * nextZoom
+        PanY = screenY - centerY - (worldY - centerY) * nextZoom }
+
 let panBy dx dy state =
     { state with PanX = state.PanX + dx; PanY = state.PanY + dy }
 
@@ -439,11 +452,12 @@ let handleMouseMove x y state =
             let newX = x - offsetX
             let newY = y - offsetY
             let dx, dy = newX - node.X, newY - node.Y
-            moveSelectedNodes dx dy state
+            let moved = moveSelectedNodes dx dy state
+            { moved with PhysicsSleeping = false }
         | None -> state
     | DragSelection (lastX, lastY) ->
         let moved = moveSelectedNodes (x - lastX) (y - lastY) state
-        { moved with Drag = DragSelection (x, y) }
+        { moved with Drag = DragSelection (x, y); PhysicsSleeping = false }
     | SelectBox _ -> state
     | PanCanvas (lastX, lastY) ->
         { state with PanX = state.PanX + (x - lastX); PanY = state.PanY + (y - lastY); Drag = PanCanvas (x, y) }
@@ -466,7 +480,7 @@ let handleMouseDown x y shift ctrl state =
             if Set.contains id selected then
                 DragNode (id, x - node.X, y - node.Y, x, y)
             else NoDrag
-        { state with SelectedNodes = selected; SelectedEdges = Set.empty; Drag = drag }
+        { state with SelectedNodes = selected; SelectedEdges = Set.empty; Drag = drag; PhysicsSleeping = false }
     | Some (Choice2Of2 id) ->
         let selected = if shift || ctrl then Set.add id state.SelectedEdges else Set.singleton id
         { state with SelectedNodes = Set.empty; SelectedEdges = selected; Drag = NoDrag }
